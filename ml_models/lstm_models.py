@@ -10,6 +10,7 @@ import glob
 import gzip
 import pickle
 import logging
+import argparse
 from copy import deepcopy
 
 import numpy as np
@@ -33,6 +34,13 @@ from config.config import (
     FORECAST_HIDDEN_SIZE,
     FORECAST_EPOCHS,
     MODEL_DIR,
+    DATA_DIR,
+    ALIBABA_DATA_DIR,
+)
+from data.dataset_utils import (
+    detect_dataset_type,
+    load_aggregated_series_by_timestamp,
+    select_feature_columns,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -373,9 +381,9 @@ class ResourceForecaster:
     Predicts future CPU usage for capacity planning.
     """
 
-    def __init__(self, target="avg_cpu"):
+    def __init__(self, target="avg_cpu", feature_cols=None):
         self.target = target
-        self.feature_cols = ["min_cpu", "max_cpu", "avg_cpu", "cpu_range"]
+        self.feature_cols = list(feature_cols) if feature_cols is not None else ["min_cpu", "max_cpu", "avg_cpu", "cpu_range"]
         self.scaler_x = MinMaxScaler()
         self.scaler_y = MinMaxScaler()
         self.model = None
@@ -730,55 +738,24 @@ def visualize_lstm_results(
 
 
 # ================================================================
-# DATA LOADING
+# DATA LOADING / TRAINING ENTRYPOINT
 # ================================================================
 
-def load_cpu_records(raw_dir, max_records=200_000):
-    """Load CPU records from one or more downloaded Azure CPU files."""
-    patterns = [
-        os.path.join(raw_dir, "vm_cpu_readings-file-*-of-195.csv.gz"),
-        os.path.join(raw_dir, "vm_cpu_readings-*.csv.gz"),
-    ]
 
-    cpu_files = []
-    for pattern in patterns:
-        cpu_files.extend(glob.glob(pattern))
+def load_global_aggregated_series(raw_dir, dataset="auto", target_unique_timestamps=None, max_records=None):
+    """Dataset-agnostic aggregated time series loader."""
+    if target_unique_timestamps is None:
+        target_unique_timestamps = max(LSTM_SEQUENCE_LENGTH + FORECAST_HORIZON + 20, 50)
 
-    cpu_files = sorted(set(cpu_files))
-    if not cpu_files:
-        raise FileNotFoundError("No CPU reading files found in data/raw/")
-
-    logger.info(f"Found {len(cpu_files)} CPU file(s). Reading up to {max_records:,} rows.")
-
-    records = []
-    for file_path in cpu_files:
-        logger.info(f"Loading data from {os.path.basename(file_path)}...")
-        with gzip.open(file_path, "rt") as f:
-            reader = csv.reader(f)
-            for row in reader:
-                if len(row) < 5:
-                    continue
-                try:
-                    min_cpu = float(row[2])
-                    max_cpu = float(row[3])
-                    avg_cpu = float(row[4])
-
-                    records.append({
-                        "timestamp": float(row[0]),
-                        "vm_id": row[1].strip(),
-                        "min_cpu": min_cpu,
-                        "max_cpu": max_cpu,
-                        "avg_cpu": avg_cpu,
-                        "cpu_range": max_cpu - min_cpu,
-                        "source_file": os.path.basename(file_path),
-                    })
-
-                    if len(records) >= max_records:
-                        return pd.DataFrame(records)
-                except (ValueError, IndexError):
-                    continue
-
-    return pd.DataFrame(records)
+    df = load_aggregated_series_by_timestamp(
+        data_dir=raw_dir,
+        dataset=dataset,
+        target_unique_timestamps=target_unique_timestamps,
+        max_records=max_records,
+    )
+    if df.empty:
+        raise ValueError(f"No normalized records could be loaded from {raw_dir}")
+    return df
 
 
 def select_training_vm(df):
@@ -796,36 +773,52 @@ def select_training_vm(df):
     raise ValueError("No VM records available for training.")
 
 
-# ================================================================
-# MAIN TRAINING PIPELINE
-# ================================================================
-
-def train_all_models():
+def train_all_models(dataset="auto", data_dir=None, target_unique_timestamps=None, max_records=None):
     """Train both LSTM models and generate visualizations."""
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    raw_dir = os.path.join(project_root, "data", "raw")
+    if data_dir is None:
+        if dataset == "alibaba":
+            data_dir = ALIBABA_DATA_DIR
+        elif dataset == "azure":
+            data_dir = DATA_DIR
+        else:
+            data_dir = ALIBABA_DATA_DIR if os.path.exists(ALIBABA_DATA_DIR) else DATA_DIR
 
-    df = load_cpu_records(raw_dir, max_records=200_000)
-    if df.empty:
-        raise ValueError("Loaded dataframe is empty.")
+    resolved_dataset = detect_dataset_type(data_dir) if dataset == "auto" else dataset
 
-    logger.info(f"Total loaded records: {len(df):,}")
+    agg_df = load_global_aggregated_series(
+        data_dir,
+        dataset=resolved_dataset,
+        target_unique_timestamps=target_unique_timestamps,
+        max_records=max_records,
+    )
 
-    sample_vm = select_training_vm(df)
-    vm_data = df[df["vm_id"] == sample_vm].sort_values("timestamp").reset_index(drop=True)
-    logger.info(f"Training on VM: {sample_vm[:16]}... ({len(vm_data):,} records)")
+    if agg_df.empty:
+        raise ValueError("Aggregated dataframe is empty.")
 
-    # ---- Model 1: LSTM Autoencoder ----
+    feature_cols = select_feature_columns(agg_df)
+    logger.info(f"Resolved dataset: {resolved_dataset}")
+    logger.info(f"Training data directory: {data_dir}")
+    logger.info(f"Global aggregated time-series length: {len(agg_df):,}")
+    logger.info(f"Selected feature columns: {feature_cols}")
+
+    min_required_ae = LSTM_SEQUENCE_LENGTH
+    min_required_fc = LSTM_SEQUENCE_LENGTH + FORECAST_HORIZON
+
+    if len(agg_df) < min_required_ae:
+        raise ValueError(
+            f"Not enough aggregated timestamps for autoencoder. "
+            f"Need at least {min_required_ae}, got {len(agg_df)}."
+        )
+
     logger.info("\n" + "=" * 50)
     logger.info("  Training LSTM Autoencoder")
     logger.info("=" * 50)
 
-    ae_detector = AnomalyDetectorLSTM()
-    ae_errors = ae_detector.fit(vm_data, epochs=LSTM_EPOCHS)
-    ae_anomalies, ae_test_errors = ae_detector.predict(vm_data)
+    ae_detector = AnomalyDetectorLSTM(feature_columns=feature_cols)
+    ae_detector.fit(agg_df, epochs=LSTM_EPOCHS)
+    ae_anomalies, ae_test_errors = ae_detector.predict(agg_df)
     ae_detector.save()
 
-    # ---- Model 2: LSTM Forecaster ----
     logger.info("\n" + "=" * 50)
     logger.info("  Training LSTM Forecaster (CPU)")
     logger.info("=" * 50)
@@ -833,9 +826,9 @@ def train_all_models():
     forecast_actual = np.array([])
     forecast_preds = np.array([])
 
-    try:
-        forecaster = ResourceForecaster(target="avg_cpu")
-        X_val, y_val = forecaster.fit(vm_data, epochs=FORECAST_EPOCHS)
+    if len(agg_df) >= min_required_fc + 5:
+        forecaster = ResourceForecaster(target="avg_cpu", feature_cols=feature_cols)
+        X_val, y_val = forecaster.fit(agg_df, epochs=FORECAST_EPOCHS)
         forecaster.save()
 
         preds = []
@@ -848,12 +841,14 @@ def train_all_models():
         forecast_actual = forecaster.scaler_y.inverse_transform(
             y_val[:n_forecast_samples, 0].reshape(-1, 1)
         ).flatten()
-    except Exception as e:
-        logger.warning(f"Skipping forecaster visualization because of: {e}")
+    else:
+        logger.warning(
+            "Not enough aggregated timestamps for forecasting model. "
+            "Skipping forecaster training."
+        )
 
-    # ---- Visualization ----
     visualize_lstm_results(
-        df=vm_data,
+        df=agg_df,
         anomalies=ae_anomalies,
         errors=ae_test_errors,
         threshold=ae_detector.threshold,
@@ -865,5 +860,21 @@ def train_all_models():
     logger.info("\n[DONE] All LSTM models trained and saved!")
 
 
+def main():
+    parser = argparse.ArgumentParser(description="Train LSTM models on Azure or Alibaba traces")
+    parser.add_argument("--dataset", choices=["auto", "azure", "alibaba"], default="auto")
+    parser.add_argument("--data-dir", type=str, default=None)
+    parser.add_argument("--target-unique-timestamps", type=int, default=None)
+    parser.add_argument("--max-records", type=int, default=None)
+    args = parser.parse_args()
+
+    train_all_models(
+        dataset=args.dataset,
+        data_dir=args.data_dir,
+        target_unique_timestamps=args.target_unique_timestamps,
+        max_records=args.max_records,
+    )
+
+
 if __name__ == "__main__":
-    train_all_models()
+    main()
